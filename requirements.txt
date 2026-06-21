@@ -1,0 +1,5 @@
+# Scan and paper modes use only the Python standard library.
+# The two packages below are needed ONLY for live trading and tests.
+
+py-clob-client>=0.17   # live order placement (FOK/FAK) — live mode only
+pytest>=7.0            # run the test suite

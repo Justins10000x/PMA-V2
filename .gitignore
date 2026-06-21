@@ -1,0 +1,15 @@
+# Secrets are read from the environment and never written to disk,
+# but guard against accidents anyway.
+.env
+credentials.json
+
+# Runtime artifacts
+state.json
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
