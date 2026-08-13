@@ -1,5 +1,7 @@
 # PMA v2 — Polymarket Mutually-exclusive Arbitrage
 
+# Can't stress this enough but gamble at your own risk, this isn't free money
+
 A **correct reference implementation** of the "buy every outcome for less than
 $1" arbitrage on [Polymarket](https://polymarket.com) negRisk markets.
 
