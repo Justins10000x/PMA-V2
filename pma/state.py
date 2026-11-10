@@ -24,6 +24,7 @@ log = logging.getLogger("pma")
 class Session:
     realised_profit: float = 0.0
     realised_loss: float = 0.0          # from unwinds / aborted partials
+    committed: float = 0.0              # capital locked in filled positions
     trades: int = 0
     aborts: int = 0
     history: List[dict] = field(default_factory=list)
@@ -39,6 +40,10 @@ class Session:
         status = result.get("status")
         if status == "filled":
             self.realised_profit += result.get("realised", 0.0)
+            # Stays committed until the market resolves. This is not released
+            # automatically: lower it by hand (or reset state.json) once
+            # positions have paid out.
+            self.committed += result.get("committed", 0.0)
             self.trades += 1
         elif status == "partial_unwound":
             # Unwind cost is realised separately when known; count the abort.

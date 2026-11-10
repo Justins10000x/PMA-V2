@@ -55,10 +55,31 @@ class Opportunity:
     net_profit: float    # payout - total_cost
     margin_pct: float    # net_profit / total_cost * 100
     per_leg_plan: List[dict] = field(default_factory=list)
+    # Set by the scanner after evaluation (not part of the pricing math):
+    days_to_resolution: Optional[float] = None
+    annualised_pct: Optional[float] = None
+    has_catch_all: bool = False
 
     @property
     def is_profitable(self) -> bool:
         return self.net_profit > 0
+
+    def beats_hurdle(self, hurdle_apr_pct: float) -> bool:
+        """True if the annualised return clears the hurdle. Unknown dates fail."""
+        if hurdle_apr_pct <= 0:
+            return True
+        return self.annualised_pct is not None and self.annualised_pct >= hurdle_apr_pct
+
+
+def annualised_pct(margin_pct: float, days: Optional[float]) -> Optional[float]:
+    """Simple (non-compounded) annualised return for capital locked `days`.
+
+    A 2% gap locked for six months is about 4% a year, which can be worse
+    than holding cash. Returns None when the resolution date is unknown.
+    """
+    if days is None or days <= 0:
+        return None
+    return margin_pct * 365.0 / days
 
 
 def effective_cost(asks: List[AskLevel], shares: float) -> Tuple[float, float]:

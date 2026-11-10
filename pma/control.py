@@ -15,7 +15,7 @@ from __future__ import annotations
 from .arbitrage import Opportunity
 
 
-def render(opp: Opportunity, mode: str) -> str:
+def render(opp: Opportunity, mode: str, hurdle_apr: float = 0.0) -> str:
     lines = []
     lines.append("  " + "=" * 60)
     lines.append(f"  OPPORTUNITY  [{mode.upper()}]  {opp.event}")
@@ -23,8 +23,20 @@ def render(opp: Opportunity, mode: str) -> str:
     lines.append(f"  Legs:            {len(opp.legs)}")
     lines.append(f"  Shares per leg:  {opp.shares:g}  (equal across all legs)")
     lines.append(f"  Total cost:      ${opp.total_cost:,.4f}")
-    lines.append(f"  Guaranteed payout: ${opp.payout:,.4f}  (one leg resolves to $1)")
-    lines.append(f"  Net profit:      ${opp.net_profit:,.4f}  ({opp.margin_pct:.3f}%)")
+    lines.append(f"  Payout at resolution: ${opp.payout:,.4f}  (if a listed outcome wins)")
+    lines.append(f"  Gross gap:       ${opp.net_profit:,.4f}  ({opp.margin_pct:.3f}%)")
+    if opp.annualised_pct is None:
+        lines.append("  Annualised:      unknown (no future end date listed)")
+    else:
+        lines.append(
+            f"  Annualised:      {opp.annualised_pct:.1f}% over "
+            f"{opp.days_to_resolution:.0f} day(s) locked  (hurdle {hurdle_apr:g}%)"
+        )
+    verdict = "CLEARS HURDLE" if opp.beats_hurdle(hurdle_apr) else "BELOW HURDLE - not worth the lock-up"
+    lines.append(f"  Verdict:         {verdict}")
+    if not opp.has_catch_all:
+        lines.append("  WARNING: no catch-all outcome detected. If an unlisted outcome")
+        lines.append("           wins, every leg pays $0. Read the market rules first.")
     lines.append("  Fill plan (ask-side, marketable):")
     for p in opp.per_leg_plan:
         ap = f"@{p['avg_price']:.4f}" if p["avg_price"] is not None else "@ n/a"

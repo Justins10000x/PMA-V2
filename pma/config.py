@@ -56,7 +56,17 @@ MIN_EDGE_RETENTION = 0.5         # require >=50% of detected profit to remain
 # TIMING
 # ----------------------------------------------------------------------------
 SCAN_INTERVAL = 60               # seconds between scans
-MAX_MARKETS = 600                # discovery breadth per scan
+MAX_EVENTS = int(os.environ.get("PMA_MAX_EVENTS", "1500"))  # events per scan
+
+# Time value. Capital stays locked until the market resolves, so a gap is only
+# worth taking if its annualised return beats what the cash could earn
+# elsewhere. Set this to your own risk-free rate plus the premium you want.
+# 0 disables the filter.
+HURDLE_APR = float(os.environ.get("PMA_HURDLE_APR", "8"))
+
+# Skip fetching order books for groups whose quoted asks already sum above
+# $1 by more than this. Quotes can lag the book, hence the slack.
+PREFILTER_SLACK = 0.03
 
 # ----------------------------------------------------------------------------
 # ENDPOINTS & PATHS

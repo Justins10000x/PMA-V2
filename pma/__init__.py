@@ -1,2 +1,3 @@
-"""PMA v2 — corrected ask-side, equal-share arbitrage."""
-__version__ = "2.0.0"
+"""PMA v2.1 - ask-side, equal-share scanner for Polymarket negRisk events."""
+
+__version__ = "2.1.0"
