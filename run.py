@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-PMA v2.1 - main loop.
+PMA v2.2 - main loop.
 
 Each scan:
     discover events with all their markets (Gamma)
       -> keep only negRisk groups that are provably complete
         -> skip groups whose quoted asks are clearly above $1
           -> fetch real ask books in batches (CLOB)
-            -> evaluate: ask-side, equal shares, depth-aware   (pure, tested)
+            -> price both sides after taker fees: buy every YES (pays $1)
+               or buy every NO (pays n-1); equal shares, depth-aware
+              -> log every priced group to logs/scans.csv
               -> annualise against the lock-up, compare with the hurdle
                 -> human approval gate
                   -> FOK execution with unwind on partial fills
@@ -26,8 +28,8 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from pma import config, control, execution, orderbook
-from pma.arbitrage import annualised_pct, evaluate_group
+from pma import config, control, execution, orderbook, scanlog
+from pma.arbitrage import annualised_pct, evaluate_group, top_of_book
 from pma.state import Session, reconcile
 
 
@@ -43,62 +45,94 @@ def setup_logging():
 
 
 def find_opportunities(session, log):
-    """Return opportunities sorted best-first (by annualised return)."""
+    """Price every complete group on both sides. Returns gaps, best first."""
     events = orderbook.discover_events()
+    if len(events) >= config.MAX_EVENTS:
+        log.info("  event cap reached (%d); raise PMA_MAX_EVENTS to see more.",
+                 config.MAX_EVENTS)
     reasons = Counter()
-    candidates = []
+    todo = []          # (candidate, side)
     for ev in events:
         cand, reason = orderbook.select_complete_group(ev)
         if cand is None:
             reasons[reason] += 1
             continue
-        quoted = orderbook.gamma_ask_sum(cand.markets)
-        if quoted is not None and quoted > 1.0 + config.PREFILTER_SLACK:
-            reasons["asks_above_1"] += 1
-            continue
-        candidates.append(cand)
+        asks = orderbook.gamma_ask_sum(cand.markets)
+        bids = orderbook.gamma_bid_sum(cand.markets)
+        want_yes = asks is None or asks <= 1.0 + config.PREFILTER_SLACK
+        want_no = bids is None or bids >= 1.0 - config.PREFILTER_SLACK
+        if want_yes:
+            todo.append((cand, "YES"))
+        if want_no:
+            todo.append((cand, "NO"))
+        if not (want_yes or want_no):
+            reasons["far_from_parity"] += 1
 
-    log.info("  %d events -> %d complete negRisk groups worth pricing",
-             len(events), len(candidates))
+    log.info("  %d events -> %d group/side pairs worth pricing",
+             len(events), len(todo))
     log.info("  skipped: %s", dict(reasons) or "none")
 
-    tokens = [orderbook.yes_token_id(m) for c in candidates for m in c.markets]
-    books = orderbook.fetch_ask_books(tokens)
+    tokens = []
+    for cand, side in todo:
+        pick = orderbook.yes_token_id if side == "YES" else orderbook.no_token_id
+        tokens += [pick(m) for m in cand.markets]
+    books = orderbook.fetch_ask_books([t for t in tokens if t])
 
-    headroom = config.MAX_EXPOSURE - session.committed
-    cap = min(config.PER_POSITION_MAX, headroom)
+    cap = min(config.PER_POSITION_MAX, config.MAX_EXPOSURE - session.committed)
     if cap <= 0:
         log.info("  Exposure limit reached ($%.2f committed).", session.committed)
-        return []
+        cap = config.PER_POSITION_MAX      # keep scanning and logging anyway
 
-    found = []
-    for cand in candidates:
-        legs = orderbook.build_legs(cand, books)
+    found, rows = [], []
+    unpriced = Counter()
+    for cand, side in todo:
+        legs = orderbook.build_legs(cand, books, side)
         if len(legs) < 2:
+            unpriced[side] += 1
             continue
+        payout = 1.0 if side == "YES" else float(len(legs) - 1)
         opp = evaluate_group(cand.slug, legs, per_position_max=cap,
-                             min_net_profit=config.MIN_NET_PROFIT)
-        if not opp:
-            continue
-        opp.days_to_resolution = cand.days
-        opp.annualised_pct = annualised_pct(opp.margin_pct, cand.days)
-        opp.has_catch_all = cand.catch_all
-        found.append(opp)
+                             min_net_profit=config.MIN_NET_PROFIT,
+                             payout_per_set=payout, side=side)
+        if opp:
+            opp.days_to_resolution = cand.days
+            opp.annualised_pct = annualised_pct(opp.margin_pct, cand.days)
+            opp.has_catch_all = cand.catch_all
+            found.append(opp)
+        top = top_of_book(legs, payout)
+        if top:
+            rows.append(scanlog.make_row(cand, side, payout, top, opp))
+
+    scanlog.append(config.SCAN_LOG, rows)
+    if unpriced:
+        log.info("  could not price %s: a leg had no offers, so the set "
+                 "cannot be completed.", dict(unpriced))
+    if rows:
+        best = max(rows, key=lambda r: r["edge_pct"])
+        log.info("  priced %d pairs; closest to a gap: %+.2f%% (%s, %s)",
+                 len(rows), best["edge_pct"], best["side"], best["slug"][:40])
 
     found.sort(key=lambda o: (o.annualised_pct is not None, o.annualised_pct or 0),
                reverse=True)
     return found
 
 
-def scan_once(session, client, log):
+def scan_once(session, client, log, verbose=False):
     opportunities = find_opportunities(session, log)
     if not opportunities:
-        log.info("  No ask-side gap below $1 this scan.")
+        log.info("  No gap after fees on either side this scan.")
         return
 
     for opp in opportunities:
+        if not verbose and not opp.beats_hurdle(config.HURDLE_APR):
+            ann = ("unknown date" if opp.annualised_pct is None else
+                   f"{opp.annualised_pct:.1f}%/yr over {opp.days_to_resolution:.0f}d")
+            log.info("  below hurdle: %s %s  gap %.2f%% ($%.2f)  %s",
+                     opp.side, opp.event[:44], opp.margin_pct, opp.net_profit, ann)
+            continue
         print(control.render(opp, config.MODE, config.HURDLE_APR))
-        if config.MODE == "scan" or not opp.beats_hurdle(config.HURDLE_APR):
+        if (config.MODE == "scan" or opp.side != "YES"
+                or not opp.beats_hurdle(config.HURDLE_APR)):
             continue
         if opp.total_cost > config.MAX_EXPOSURE - session.committed:
             log.info("  skipping: not enough exposure headroom left.")
@@ -116,15 +150,17 @@ def scan_once(session, client, log):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PMA v2.1 scanner")
+    parser = argparse.ArgumentParser(description="PMA v2.2 scanner")
     parser.add_argument("--once", action="store_true",
                         help="run a single scan and exit")
+    parser.add_argument("--verbose", action="store_true",
+                        help="print the full fill plan for below-hurdle gaps too")
     args = parser.parse_args()
 
     config.validate()
     log = setup_logging()
     log.info("=" * 60)
-    log.info("PMA v2.1 - MODE=%s  approval=%s", config.MODE.upper(),
+    log.info("PMA v2.2 - MODE=%s  approval=%s", config.MODE.upper(),
              config.REQUIRE_APPROVAL)
     log.info("Portfolio $%.0f | max exposure $%.0f | per-position $%.0f | "
              "min gap $%.2f | hurdle %g%% a year", config.PORTFOLIO_SIZE,
@@ -143,7 +179,7 @@ def main():
             log.info("scanning... (session P&L $%.4f)", session.net)
             started = time.time()
             try:
-                scan_once(session, client, log)
+                scan_once(session, client, log, args.verbose)
             except SystemExit:
                 raise
             except Exception as e:  # noqa: BLE001

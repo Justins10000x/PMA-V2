@@ -39,10 +39,26 @@ class Leg:
 
     token_id: str
     outcome: str
-    asks: List[AskLevel]  # MUST be sorted ascending by price
+    asks: List[AskLevel]  # MUST be sorted ascending by price (raw, before fees)
+    fee_rate: float = 0.0  # taker fee rate for this market (0 = fee-free)
+    fee_exp: float = 1.0
 
     def total_depth(self) -> float:
         return sum(size for _, size in self.asks)
+
+    def fee_per_share(self, price: float) -> float:
+        """Taker fee per share: rate * (p * (1 - p)) ** exponent.
+
+        Highest at 50c, near zero at the extremes. Modelled as an extra USDC
+        cost per share, which is an approximation of how it is collected.
+        """
+        if self.fee_rate <= 0:
+            return 0.0
+        return self.fee_rate * (price * (1.0 - price)) ** self.fee_exp
+
+    def cost_asks(self) -> List[AskLevel]:
+        """Ask levels with the taker fee folded into each price."""
+        return [(p + self.fee_per_share(p), size) for p, size in self.asks]
 
 
 @dataclass
@@ -55,6 +71,9 @@ class Opportunity:
     net_profit: float    # payout - total_cost
     margin_pct: float    # net_profit / total_cost * 100
     per_leg_plan: List[dict] = field(default_factory=list)
+    side: str = "YES"            # "YES": buy every YES. "NO": buy every NO.
+    payout_per_set: float = 1.0  # $1 for a YES set, n-1 for a NO set
+    total_fees: float = 0.0      # taker fees included in total_cost
     # Set by the scanner after evaluation (not part of the pricing math):
     days_to_resolution: Optional[float] = None
     annualised_pct: Optional[float] = None
@@ -119,6 +138,8 @@ def evaluate_group(
     *,
     per_position_max: float,
     min_net_profit: float = 0.0,
+    payout_per_set: float = 1.0,
+    side: str = "YES",
 ) -> Optional[Opportunity]:
     """Find the profit-maximising equal-share arbitrage for one group.
 
@@ -133,6 +154,9 @@ def evaluate_group(
     """
     if len(legs) < 2:
         return None
+
+    # Price everything after taker fees. Raw books are kept for the fill plan.
+    cost_books = [leg.cost_asks() for leg in legs]
 
     # Equal shares means we can fill at most as many sets as the THINNEST leg.
     max_fillable = min(leg.total_depth() for leg in legs)
@@ -158,8 +182,8 @@ def evaluate_group(
         mid = (prev + bp) / 2.0
         marginal = 0.0
         ok = True
-        for leg in legs:
-            p = _price_at_depth(leg.asks, mid)
+        for book in cost_books:
+            p = _price_at_depth(book, mid)
             if p is None:
                 ok = False
                 break
@@ -167,8 +191,8 @@ def evaluate_group(
         if not ok:
             break
 
-        # Once the marginal set-cost reaches $1 there is no more profit to add.
-        if marginal >= 1.0:
+        # Once the marginal set-cost reaches the payout there is no profit to add.
+        if marginal >= payout_per_set:
             break
 
         width = bp - prev
@@ -189,20 +213,25 @@ def evaluate_group(
     if shares <= 0:
         return None
 
-    payout = shares * 1.0
+    payout = shares * payout_per_set
     net_profit = payout - total_cost
     if net_profit <= min_net_profit:
         return None
 
     per_leg_plan = []
-    for leg in legs:
+    total_fees = 0.0
+    for leg, book in zip(legs, cost_books):
         cost, filled = effective_cost(leg.asks, shares)
+        with_fees, _ = effective_cost(book, shares)
+        fee = with_fees - cost
+        total_fees += fee
         per_leg_plan.append(
             {
                 "token_id": leg.token_id,
                 "outcome": leg.outcome,
                 "shares": round(filled, 4),
                 "cost": round(cost, 4),
+                "fee": round(fee, 4),
                 "avg_price": round(cost / filled, 4) if filled else None,
             }
         )
@@ -216,4 +245,26 @@ def evaluate_group(
         net_profit=round(net_profit, 4),
         margin_pct=round((net_profit / total_cost) * 100, 4) if total_cost else 0.0,
         per_leg_plan=per_leg_plan,
+        side=side,
+        payout_per_set=payout_per_set,
+        total_fees=round(total_fees, 4),
     )
+
+
+def top_of_book(legs: List[Leg], payout_per_set: float = 1.0) -> Optional[dict]:
+    """How far one share-set is from parity at the best asks, after fees.
+
+    edge_pct is negative when there is no gap (the usual case). Logged every
+    scan so you can see how close each group gets, not just when it crosses.
+    """
+    if len(legs) < 2 or any(not leg.asks for leg in legs):
+        return None
+    raw = sum(leg.asks[0][0] for leg in legs)
+    fees = sum(leg.fee_per_share(leg.asks[0][0]) for leg in legs)
+    cost = raw + fees
+    return {
+        "ask_sum": round(raw, 6),
+        "fees": round(fees, 6),
+        "edge_pct": round((payout_per_set - cost) / cost * 100, 4),
+        "min_size": min(leg.asks[0][1] for leg in legs),
+    }

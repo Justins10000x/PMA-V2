@@ -88,6 +88,29 @@ def test_yes_token_matched_by_label_not_position():
     assert orderbook.yes_token_id(m) == "YES-TOK"
 
 
+# --- fees and NO side ------------------------------------------------------
+def test_fee_params():
+    assert orderbook.fee_params({"feesEnabled": False}) == (0.0, 1.0)
+    m = {"feesEnabled": True, "feeSchedule": {"rate": 0.04, "exponent": 1}}
+    assert orderbook.fee_params(m) == (0.04, 1.0)
+    # Nothing reported: assume the default so gaps are not overstated.
+    assert orderbook.fee_params({})[0] == orderbook.config.DEFAULT_FEE_RATE
+
+
+def test_no_token_and_no_side_legs():
+    m = {"clobTokenIds": '["NO-TOK", "YES-TOK"]', "outcomes": '["No", "Yes"]'}
+    assert orderbook.no_token_id(m) == "NO-TOK"
+    cand, _ = orderbook.select_complete_group(event([market("A"), market("B")]))
+    legs = orderbook.build_legs(cand, {"A-NO": [(0.7, 5)], "B-NO": [(0.4, 5)]}, "NO")
+    assert [leg.token_id for leg in legs] == ["A-NO", "B-NO"]
+
+
+def test_gamma_bid_sum():
+    ms = [market("A", bestBid=0.6), market("B", bestBid=0.45)]
+    assert abs(orderbook.gamma_bid_sum(ms) - 1.05) < 1e-9
+    assert orderbook.gamma_bid_sum([market("A", bestBid=0.6), market("B")]) is None
+
+
 # --- prefilter -------------------------------------------------------------
 def test_gamma_ask_sum():
     assert abs(orderbook.gamma_ask_sum([market("A", 0.55), market("B", 0.5)]) - 1.05) < 1e-9
@@ -152,6 +175,62 @@ def test_batch_books_and_fallback(monkeypatch=None):
         orderbook._fetch = original
     assert books == {"T1": [(0.2, 9.0)], "T2": [(0.7, 4.0)]}
     assert calls == {"batch": 1, "single": 1}
+
+
+def _with_fetch(fake, fn):
+    original, sleep = orderbook._fetch, orderbook.time.sleep
+    orderbook._fetch, orderbook.time.sleep = fake, (lambda s: None)
+    try:
+        return fn()
+    finally:
+        orderbook._fetch, orderbook.time.sleep = original, sleep
+
+
+def _ev(i):
+    return {"id": i, "markets": [{"id": i}]}
+
+
+def test_discovery_follows_cursors():
+    pages = {None: ([_ev(1), _ev(2)], "c1"), "c1": ([_ev(3)], "c2"), "c2": ([_ev(4)], None)}
+
+    def fake(url, body=None):
+        assert "/events/keyset" in url and "version=v1&version=v2" in url
+        cursor = url.split("after_cursor=")[1] if "after_cursor=" in url else None
+        events, nxt = pages[cursor]
+        return {"events": events, "next_cursor": nxt}
+
+    got = _with_fetch(fake, lambda: orderbook.discover_events(5000))
+    assert [e["id"] for e in got] == [1, 2, 3, 4]
+
+
+def test_discovery_falls_back_to_offset_and_survives_deep_offset_error():
+    pages = {0: [_ev(i) for i in range(100)], 100: [_ev(i) for i in range(100)]}
+
+    def fake(url, body=None):
+        if "/events/keyset" in url:
+            raise RuntimeError("HTTP 404")
+        offset = int(url.split("offset=")[1])
+        if offset not in pages:
+            raise RuntimeError("HTTP 422")
+        return pages[offset]
+
+    assert len(_with_fetch(fake, lambda: orderbook.discover_events(5000))) == 200
+    pages.clear()                          # nothing at all is a real error
+    try:
+        _with_fetch(fake, lambda: orderbook.discover_events(5000))
+        raise AssertionError("expected failure")
+    except RuntimeError:
+        pass
+
+
+def test_discovery_rejects_cursor_results_without_markets():
+    def fake(url, body=None):
+        if "/events/keyset" in url:
+            return {"events": [{"id": 1}], "next_cursor": None}   # no markets
+        return [_ev(7)] if "offset=0" in url else []
+
+    got = _with_fetch(fake, lambda: orderbook.discover_events(5000))
+    assert [e["id"] for e in got] == [7]
 
 
 def test_build_legs_needs_every_leg_priced():

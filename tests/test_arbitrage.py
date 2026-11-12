@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pma.arbitrage import Leg, effective_cost, evaluate_group  # noqa: E402
+from pma.arbitrage import Leg, effective_cost, evaluate_group, top_of_book  # noqa: E402
 
 
 def approx(a, b, tol=1e-6):
@@ -104,6 +104,49 @@ def test_depth_limits_size():
 def test_single_leg_is_never_an_opportunity():
     assert evaluate_group("solo", [Leg("A", "Yes", [(0.10, 100)])],
                           per_position_max=100) is None
+
+
+def test_fees_shrink_or_remove_a_gap():
+    # Raw asks sum to 0.98: a 2% gap before fees.
+    def legs(rate):
+        return [Leg("A", "Yes", [(0.50, 1000)], fee_rate=rate),
+                Leg("B", "Yes", [(0.48, 1000)], fee_rate=rate)]
+    free = evaluate_group("f", legs(0.0), per_position_max=98)
+    assert approx(free.net_profit, 2.0, tol=1e-4) and free.total_fees == 0
+    # At 0.04 the fee per set is 0.04*(0.25 + 0.2496) = 0.019984, so the gap
+    # all but disappears: 100 sets no longer fit in $98 and profit is ~0.
+    taxed = evaluate_group("f", legs(0.04), per_position_max=98)
+    assert taxed is not None and taxed.net_profit < 0.01
+    assert approx(taxed.total_fees / taxed.shares, 0.019984, tol=1e-4)
+    # At 0.05 the fee (0.02498) exceeds the 0.02 gap entirely.
+    assert evaluate_group("f", legs(0.05), per_position_max=98) is None
+
+
+def test_fee_is_small_at_extreme_prices():
+    leg = Leg("A", "Yes", [(0.95, 10)], fee_rate=0.04)
+    assert approx(leg.fee_per_share(0.95), 0.04 * 0.95 * 0.05)
+    assert approx(leg.cost_asks()[0][0], 0.95 + 0.0019)
+
+
+def test_no_side_pays_n_minus_one():
+    # Three outcomes. NO asks sum to 1.94 < 2, so buying every NO locks 0.06.
+    legs = [Leg("A", "No", [(0.60, 100)]), Leg("B", "No", [(0.65, 100)]),
+            Leg("C", "No", [(0.69, 100)])]
+    opp = evaluate_group("n", legs, per_position_max=1000,
+                         payout_per_set=2.0, side="NO")
+    assert opp is not None and opp.side == "NO"
+    assert approx(opp.shares, 100) and approx(opp.payout, 200)
+    assert approx(opp.net_profit, 6.0, tol=1e-6)
+    # The same books are not a gap if the set only paid $1.
+    assert evaluate_group("n", legs, per_position_max=1000) is None
+
+
+def test_top_of_book_edge():
+    legs = [Leg("A", "Yes", [(0.55, 7)]), Leg("B", "Yes", [(0.50, 3)])]
+    top = top_of_book(legs)
+    assert approx(top["ask_sum"], 1.05) and top["min_size"] == 3
+    assert top["edge_pct"] < 0            # no gap: the normal state
+    assert top_of_book([legs[0], Leg("C", "Yes", [])]) is None
 
 
 if __name__ == "__main__":

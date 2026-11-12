@@ -18,13 +18,16 @@ from .arbitrage import Opportunity
 def render(opp: Opportunity, mode: str, hurdle_apr: float = 0.0) -> str:
     lines = []
     lines.append("  " + "=" * 60)
-    lines.append(f"  OPPORTUNITY  [{mode.upper()}]  {opp.event}")
+    lines.append(f"  GAP  [{mode.upper()}]  buy every {opp.side}  |  {opp.event}")
     lines.append("  " + "-" * 60)
     lines.append(f"  Legs:            {len(opp.legs)}")
     lines.append(f"  Shares per leg:  {opp.shares:g}  (equal across all legs)")
-    lines.append(f"  Total cost:      ${opp.total_cost:,.4f}")
-    lines.append(f"  Payout at resolution: ${opp.payout:,.4f}  (if a listed outcome wins)")
-    lines.append(f"  Gross gap:       ${opp.net_profit:,.4f}  ({opp.margin_pct:.3f}%)")
+    lines.append(f"  Total cost:      ${opp.total_cost:,.4f}  (includes ${opp.total_fees:,.4f} taker fees)")
+    if opp.side == "YES":
+        lines.append(f"  Payout at resolution: ${opp.payout:,.4f}  (if a listed outcome wins)")
+    else:
+        lines.append(f"  Payout at resolution: ${opp.payout:,.4f}  (all legs but one pay $1)")
+    lines.append(f"  Gap after fees:  ${opp.net_profit:,.4f}  ({opp.margin_pct:.3f}%)")
     if opp.annualised_pct is None:
         lines.append("  Annualised:      unknown (no future end date listed)")
     else:
@@ -34,7 +37,11 @@ def render(opp: Opportunity, mode: str, hurdle_apr: float = 0.0) -> str:
         )
     verdict = "CLEARS HURDLE" if opp.beats_hurdle(hurdle_apr) else "BELOW HURDLE - not worth the lock-up"
     lines.append(f"  Verdict:         {verdict}")
-    if not opp.has_catch_all:
+    if opp.side == "NO":
+        lines.append("  NOTE: scan only. A full NO set can in principle be converted to")
+        lines.append("        cash before resolution (negRisk conversion), which this tool")
+        lines.append("        does not do. These gaps usually close within seconds.")
+    elif not opp.has_catch_all:
         lines.append("  WARNING: no catch-all outcome detected. If an unlisted outcome")
         lines.append("           wins, every leg pays $0. Read the market rules first.")
     lines.append("  Fill plan (ask-side, marketable):")
@@ -42,6 +49,7 @@ def render(opp: Opportunity, mode: str, hurdle_apr: float = 0.0) -> str:
         ap = f"@{p['avg_price']:.4f}" if p["avg_price"] is not None else "@ n/a"
         lines.append(
             f"    - {p['outcome'][:42]:<42} {p['shares']:g} sh {ap}  ${p['cost']:.4f}"
+            f"  +fee ${p.get('fee', 0):.4f}"
         )
     lines.append("  " + "=" * 60)
     return "\n".join(lines)

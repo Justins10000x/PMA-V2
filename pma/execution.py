@@ -45,12 +45,13 @@ def edge_still_present(opp: Opportunity) -> bool:
     if not config.STALENESS_REFRESH:
         return True
 
-    from .arbitrage import effective_cost
+    from .arbitrage import Leg, effective_cost
 
     fresh_cost = 0.0
     for leg in opp.legs:
-        asks = fetch_ask_book(leg.token_id)
-        cost, filled = effective_cost(asks, opp.shares)
+        fresh = Leg(leg.token_id, leg.outcome, fetch_ask_book(leg.token_id),
+                    leg.fee_rate, leg.fee_exp)
+        cost, filled = effective_cost(fresh.cost_asks(), opp.shares)
         if filled < opp.shares - 1e-9:
             log.warning("    staleness: %s can no longer fill %.4f shares",
                         leg.outcome[:30], opp.shares)
@@ -105,6 +106,9 @@ def _unwind_sell(client, token_id: str, shares: float, paper: bool):
 # ---------------------------------------------------------------------------
 def execute(opp: Opportunity, client, paper: bool) -> dict:
     """Attempt the full multi-leg arbitrage. Returns a result record."""
+    if opp.side != "YES":
+        # NO-side sets need an on-chain conversion step this tool does not do.
+        return {"event": opp.event, "status": "unsupported_side", "realised": 0.0}
     if config.STALENESS_REFRESH and not edge_still_present(opp):
         return {"event": opp.event, "status": "aborted_stale", "realised": 0.0}
 

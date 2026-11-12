@@ -19,6 +19,7 @@ Only read endpoints live here; nothing in this file moves money.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import urllib.parse
@@ -29,6 +30,8 @@ from typing import Dict, List, Optional, Tuple
 
 from . import config
 from .arbitrage import AskLevel, Leg
+
+log = logging.getLogger("pma")
 
 _HEADERS = {
     "Accept": "application/json",
@@ -57,14 +60,44 @@ def _as_list(value) -> list:
 # ---------------------------------------------------------------------------
 # DISCOVERY
 # ---------------------------------------------------------------------------
-def discover_events(max_events: int = config.MAX_EVENTS) -> List[dict]:
-    """Page through open events. Each event carries its full `markets` list."""
+def _events_by_cursor(max_events: int, versions: bool) -> List[dict]:
+    """Page with the keyset (cursor) endpoint, which has no depth limit."""
+    events: List[dict] = []
+    cursor = None
+    while len(events) < max_events:
+        params = [("closed", "false"), ("limit", "100")]
+        if versions:
+            # Without this the API returns only one of its two protocols.
+            params += [("version", "v1"), ("version", "v2")]
+        if cursor:
+            params.append(("after_cursor", cursor))
+        page = _fetch(f"{config.GAMMA_API}/events/keyset?{urllib.parse.urlencode(params)}")
+        batch = page.get("events", []) if isinstance(page, dict) else page
+        if not batch:
+            break
+        events.extend(batch)
+        cursor = page.get("next_cursor") if isinstance(page, dict) else None
+        if not cursor:
+            break
+        time.sleep(0.1)
+    return events
+
+
+def _events_by_offset(max_events: int) -> List[dict]:
+    """Older offset paging. The API refuses offsets past about 2,100."""
     events, offset = [], 0
     while len(events) < max_events:
         params = urllib.parse.urlencode(
             {"active": "true", "closed": "false", "limit": 100, "offset": offset}
         )
-        batch = _fetch(f"{config.GAMMA_API}/events?{params}")
+        try:
+            batch = _fetch(f"{config.GAMMA_API}/events?{params}")
+        except Exception as e:  # noqa: BLE001
+            if not events:
+                raise
+            log.info("  offset paging stopped at %d (%r); using %d events.",
+                     offset, e, len(events))
+            break
         batch = batch if isinstance(batch, list) else batch.get("events", [])
         if not batch:
             break
@@ -73,6 +106,32 @@ def discover_events(max_events: int = config.MAX_EVENTS) -> List[dict]:
         if len(batch) < 100:
             break
         time.sleep(0.2)
+    return events
+
+
+def discover_events(max_events: int = config.MAX_EVENTS) -> List[dict]:
+    """Open events, each carrying its full `markets` list.
+
+    Tries cursor paging over both protocol versions, then cursor paging with
+    the server default, then offset paging. A method is only accepted if its
+    events actually carry markets.
+    """
+    attempts = [
+        ("cursor, v1+v2", lambda: _events_by_cursor(max_events, True)),
+        ("cursor", lambda: _events_by_cursor(max_events, False)),
+    ]
+    for name, fetch_all in attempts:
+        try:
+            events = fetch_all()
+        except Exception as e:  # noqa: BLE001
+            log.info("  discovery via %s failed (%r); trying next method.", name, e)
+            continue
+        if events and any(ev.get("markets") for ev in events if isinstance(ev, dict)):
+            log.info("  discovery via %s: %d events", name, len(events))
+            return events[:max_events]
+        log.info("  discovery via %s returned nothing usable; trying next method.", name)
+    events = _events_by_offset(max_events)
+    log.info("  discovery via offset paging: %d events", len(events))
     return events
 
 
@@ -86,6 +145,33 @@ def yes_token_id(market: dict) -> Optional[str]:
         if str(label).strip().lower() == "yes":
             return str(tid)
     return str(token_ids[0])
+
+
+def no_token_id(market: dict) -> Optional[str]:
+    """Token id of the NO outcome, matched by label rather than position."""
+    token_ids = _as_list(market.get("clobTokenIds"))
+    outcomes = _as_list(market.get("outcomes"))
+    for tid, label in zip(token_ids, outcomes):
+        if str(label).strip().lower() == "no":
+            return str(tid)
+    return str(token_ids[1]) if len(token_ids) > 1 else None
+
+
+def fee_params(market: dict) -> Tuple[float, float]:
+    """(rate, exponent) of the market's taker fee.
+
+    Uses the market's own schedule when it reports one. If it reports nothing
+    either way, assume the default rate so gaps are not overstated.
+    """
+    if market.get("feesEnabled") is False:
+        return 0.0, 1.0
+    schedule = market.get("feeSchedule")
+    if isinstance(schedule, dict) and schedule.get("rate") is not None:
+        try:
+            return float(schedule["rate"]), float(schedule.get("exponent") or 1.0)
+        except (TypeError, ValueError):
+            pass
+    return config.DEFAULT_FEE_RATE, 1.0
 
 
 def leg_title(market: dict) -> str:
@@ -204,6 +290,24 @@ def gamma_ask_sum(markets: List[dict]) -> Optional[float]:
     return total
 
 
+def gamma_bid_sum(markets: List[dict]) -> Optional[float]:
+    """Sum of Gamma's quoted best YES bids, or None if any leg has no quote.
+
+    Buying NO on every leg costs roughly n - sum(YES bids) and pays n - 1, so
+    the NO side is only interesting when the bids sum to about $1 or more.
+    """
+    total = 0.0
+    for m in markets:
+        try:
+            bid = float(m.get("bestBid"))
+        except (TypeError, ValueError):
+            return None
+        if bid <= 0:
+            return None
+        total += bid
+    return total
+
+
 # ---------------------------------------------------------------------------
 # ORDER BOOKS (with depth)
 # ---------------------------------------------------------------------------
@@ -231,6 +335,7 @@ def fetch_ask_books(token_ids: List[str], chunk: int = 50) -> Dict[str, List[Ask
     one request per token if the batch call fails."""
     books: Dict[str, List[AskLevel]] = {}
     ids = list(dict.fromkeys(str(t) for t in token_ids))
+    failed_batches, last_error = 0, None
     for i in range(0, len(ids), chunk):
         part = ids[i:i + chunk]
         try:
@@ -240,8 +345,9 @@ def fetch_ask_books(token_ids: List[str], chunk: int = 50) -> Dict[str, List[Ask
                 tid = str(book.get("asset_id") or book.get("token_id") or "")
                 if tid:
                     books[tid] = _parse_asks(book)
-        except Exception:  # noqa: BLE001 - fall back to single fetches below
-            pass
+        except Exception as e:  # noqa: BLE001 - fall back to single fetches below
+            failed_batches += 1
+            last_error = e
         for t in part:
             if t not in books:
                 try:
@@ -249,16 +355,23 @@ def fetch_ask_books(token_ids: List[str], chunk: int = 50) -> Dict[str, List[Ask
                 except Exception:  # noqa: BLE001
                     books[t] = []
                 time.sleep(0.05)
+    if failed_batches:
+        log.info("  %d book batch request(s) failed (%r); fetched those one by "
+                 "one, which is slower.", failed_batches, last_error)
     return books
 
 
-def build_legs(candidate: Candidate, books: Dict[str, List[AskLevel]]) -> List[Leg]:
-    """Priced legs for a candidate; [] if any leg has no offers."""
+def build_legs(candidate: Candidate, books: Dict[str, List[AskLevel]],
+               side: str = "YES") -> List[Leg]:
+    """Priced legs for one side of a candidate; [] if any leg has no offers."""
+    pick = yes_token_id if side == "YES" else no_token_id
     legs: List[Leg] = []
     for m in candidate.markets:
-        token_id = yes_token_id(m)
+        token_id = pick(m)
         asks = books.get(token_id or "", [])
         if not asks:
             return []
-        legs.append(Leg(token_id=token_id, outcome=leg_title(m), asks=asks))
+        rate, exp = fee_params(m)
+        legs.append(Leg(token_id=token_id, outcome=leg_title(m), asks=asks,
+                        fee_rate=rate, fee_exp=exp))
     return legs
