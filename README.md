@@ -1,4 +1,4 @@
-# PMA v2.2 — Polymarket negRisk scanner
+# PMA v2.3 — Polymarket negRisk scanner
 
 A research tool that scans [Polymarket](https://polymarket.com) for events
 where buying a full set of outcomes costs less than the set pays out, and
@@ -70,6 +70,16 @@ In a negRisk event exactly one outcome wins. Two full sets can be bought:
   such a gap at seconds. This tool reports NO-side gaps but does not trade or
   convert them.
 
+### Changes in v2.3
+
+- The event list is downloaded every 30 minutes (`PMA_DISCOVERY_MINS`) and
+  cached as a watchlist; scans in between only re-price order books. Scans
+  are several times faster and put far less load on the API.
+- Event pages are requested 50 at a time, dropping to 20 if refused; the
+  API began rejecting pages of 100 in November 2026.
+- When the API refuses requests the scanner keeps its last watchlist and
+  waits, doubling the delay each time, instead of retrying every minute.
+
 ### Changes in v2.2
 
 - Taker fees modelled per market from its fee schedule, with a conservative
@@ -117,7 +127,7 @@ The live order path has not been exercised against the real exchange; do not
 rely on it without testing with trivial size first.
 
 Settings: `PMA_PORTFOLIO`, `PMA_MIN_PROFIT`, `PMA_HURDLE_APR`, `PMA_MAX_LOSS`,
-`PMA_DEFAULT_FEE_RATE`, `PMA_MAX_EVENTS`, `PMA_REQUIRE_APPROVAL`.
+`PMA_DEFAULT_FEE_RATE`, `PMA_MAX_EVENTS`, `PMA_DISCOVERY_MINS`, `PMA_REQUIRE_APPROVAL`.
 
 ---
 

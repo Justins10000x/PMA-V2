@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-PMA v2.2 - main loop.
+PMA v2.3 - main loop.
+
+Every 30 minutes (PMA_DISCOVERY_MINS):
+    download the event list (Gamma) and rebuild the watchlist: negRisk
+    groups that are provably complete and quoted near parity
 
 Each scan:
-    discover events with all their markets (Gamma)
-      -> keep only negRisk groups that are provably complete
-        -> skip groups whose quoted asks are clearly above $1
-          -> fetch real ask books in batches (CLOB)
+          fetch real ask books for the watchlist in batches (CLOB)
             -> price both sides after taker fees: buy every YES (pays $1)
                or buy every NO (pays n-1); equal shares, depth-aware
               -> log every priced group to logs/scans.csv
@@ -31,6 +32,7 @@ from pathlib import Path
 from pma import config, control, execution, orderbook, scanlog
 from pma.arbitrage import annualised_pct, evaluate_group, top_of_book
 from pma.state import Session, reconcile
+from pma.watchlist import DiscoveryUnavailable, Watchlist
 
 
 def setup_logging():
@@ -44,33 +46,10 @@ def setup_logging():
     return logging.getLogger("pma")
 
 
-def find_opportunities(session, log):
-    """Price every complete group on both sides. Returns gaps, best first."""
-    events = orderbook.discover_events()
-    if len(events) >= config.MAX_EVENTS:
-        log.info("  event cap reached (%d); raise PMA_MAX_EVENTS to see more.",
-                 config.MAX_EVENTS)
-    reasons = Counter()
-    todo = []          # (candidate, side)
-    for ev in events:
-        cand, reason = orderbook.select_complete_group(ev)
-        if cand is None:
-            reasons[reason] += 1
-            continue
-        asks = orderbook.gamma_ask_sum(cand.markets)
-        bids = orderbook.gamma_bid_sum(cand.markets)
-        want_yes = asks is None or asks <= 1.0 + config.PREFILTER_SLACK
-        want_no = bids is None or bids >= 1.0 - config.PREFILTER_SLACK
-        if want_yes:
-            todo.append((cand, "YES"))
-        if want_no:
-            todo.append((cand, "NO"))
-        if not (want_yes or want_no):
-            reasons["far_from_parity"] += 1
-
-    log.info("  %d events -> %d group/side pairs worth pricing",
-             len(events), len(todo))
-    log.info("  skipped: %s", dict(reasons) or "none")
+def find_opportunities(session, log, watch):
+    """Re-price every watched pair. Returns gaps, best first."""
+    watch.refresh(log)          # only refetches the event list when it is due
+    todo = watch.pairs
 
     tokens = []
     for cand, side in todo:
@@ -109,16 +88,20 @@ def find_opportunities(session, log):
                  "cannot be completed.", dict(unpriced))
     if rows:
         best = max(rows, key=lambda r: r["edge_pct"])
-        log.info("  priced %d pairs; closest to a gap: %+.2f%% (%s, %s)",
-                 len(rows), best["edge_pct"], best["side"], best["slug"][:40])
+        log.info("  priced %d of %d pairs; closest to a gap: %+.2f%% (%s, %s)",
+                 len(rows), len(todo), best["edge_pct"], best["side"],
+                 best["slug"][:40])
 
     found.sort(key=lambda o: (o.annualised_pct is not None, o.annualised_pct or 0),
                reverse=True)
     return found
 
 
-def scan_once(session, client, log, verbose=False):
-    opportunities = find_opportunities(session, log)
+def scan_once(session, client, log, watch, verbose=False):
+    opportunities = find_opportunities(session, log, watch)
+    if not watch.pairs:
+        log.info("  Watchlist is empty; nothing to price until the event list loads.")
+        return
     if not opportunities:
         log.info("  No gap after fees on either side this scan.")
         return
@@ -150,7 +133,7 @@ def scan_once(session, client, log, verbose=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PMA v2.2 scanner")
+    parser = argparse.ArgumentParser(description="PMA v2.3 scanner")
     parser.add_argument("--once", action="store_true",
                         help="run a single scan and exit")
     parser.add_argument("--verbose", action="store_true",
@@ -160,7 +143,7 @@ def main():
     config.validate()
     log = setup_logging()
     log.info("=" * 60)
-    log.info("PMA v2.2 - MODE=%s  approval=%s", config.MODE.upper(),
+    log.info("PMA v2.3 - MODE=%s  approval=%s", config.MODE.upper(),
              config.REQUIRE_APPROVAL)
     log.info("Portfolio $%.0f | max exposure $%.0f | per-position $%.0f | "
              "min gap $%.2f | hurdle %g%% a year", config.PORTFOLIO_SIZE,
@@ -174,20 +157,38 @@ def main():
     client = execution.load_client() if config.MODE == "live" else None
     reconcile(client)
 
+    watch = Watchlist()
+    errors = 0
     try:
         while True:
             log.info("scanning... (session P&L $%.4f)", session.net)
             started = time.time()
+            wait = config.SCAN_INTERVAL
             try:
-                scan_once(session, client, log, args.verbose)
+                scan_once(session, client, log, watch, args.verbose)
+                errors = 0
             except SystemExit:
                 raise
+            except DiscoveryUnavailable as e:
+                log.error("  %s", e)
+                # +1s so the next scan is not a hair early and skips the retry.
+                wait = max(wait, watch.seconds_until_due() + 1)
             except Exception as e:  # noqa: BLE001
-                log.error("  scan error: %r", e)
+                if orderbook.is_network_error(e):
+                    # No connection (e.g. the Mac slept): retry at the normal
+                    # interval; this puts no load on the API.
+                    log.error("  no network connection (%r); retrying in %.0f s",
+                              e, wait)
+                else:
+                    # Back off when something keeps failing instead of
+                    # retrying every minute.
+                    errors += 1
+                    wait = min(config.SCAN_INTERVAL * 2 ** errors, config.BACKOFF_MAX)
+                    log.error("  scan error: %r; next scan in %.0f min", e, wait / 60)
             log.info("  scan took %.1fs", time.time() - started)
             if args.once:
                 break
-            time.sleep(config.SCAN_INTERVAL)
+            time.sleep(wait)
     except KeyboardInterrupt:
         log.info("Stopped by user. Session P&L: $%.4f over %d trade(s).",
                  session.net, session.trades)

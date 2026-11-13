@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -60,18 +61,43 @@ def _as_list(value) -> list:
 # ---------------------------------------------------------------------------
 # DISCOVERY
 # ---------------------------------------------------------------------------
+_page_size_index = 0    # index into config.EVENT_PAGE_SIZES that last worked
+
+
+def _page_size() -> int:
+    return config.EVENT_PAGE_SIZES[_page_size_index]
+
+
+def _fetch_events_page(make_url):
+    """Fetch one page of events, dropping to a smaller page size whenever the
+    API refuses the current one with HTTP 406. The working size is remembered
+    for later pages and scans."""
+    global _page_size_index
+    while True:
+        try:
+            return _fetch(make_url(_page_size()))
+        except urllib.error.HTTPError as e:
+            if e.code != 406 or _page_size_index + 1 >= len(config.EVENT_PAGE_SIZES):
+                raise
+            _page_size_index += 1
+            log.info("  API refused page size %d (HTTP 406); using %d.",
+                     config.EVENT_PAGE_SIZES[_page_size_index - 1], _page_size())
+
+
 def _events_by_cursor(max_events: int, versions: bool) -> List[dict]:
     """Page with the keyset (cursor) endpoint, which has no depth limit."""
     events: List[dict] = []
     cursor = None
     while len(events) < max_events:
-        params = [("closed", "false"), ("limit", "100")]
-        if versions:
-            # Without this the API returns only one of its two protocols.
-            params += [("version", "v1"), ("version", "v2")]
-        if cursor:
-            params.append(("after_cursor", cursor))
-        page = _fetch(f"{config.GAMMA_API}/events/keyset?{urllib.parse.urlencode(params)}")
+        def make_url(size, cursor=cursor):
+            params = [("closed", "false"), ("limit", str(size))]
+            if versions:
+                # Without this the API returns only one of its two protocols.
+                params += [("version", "v1"), ("version", "v2")]
+            if cursor:
+                params.append(("after_cursor", cursor))
+            return f"{config.GAMMA_API}/events/keyset?{urllib.parse.urlencode(params)}"
+        page = _fetch_events_page(make_url)
         batch = page.get("events", []) if isinstance(page, dict) else page
         if not batch:
             break
@@ -79,7 +105,7 @@ def _events_by_cursor(max_events: int, versions: bool) -> List[dict]:
         cursor = page.get("next_cursor") if isinstance(page, dict) else None
         if not cursor:
             break
-        time.sleep(0.1)
+        time.sleep(config.PAGE_PAUSE)
     return events
 
 
@@ -87,11 +113,12 @@ def _events_by_offset(max_events: int) -> List[dict]:
     """Older offset paging. The API refuses offsets past about 2,100."""
     events, offset = [], 0
     while len(events) < max_events:
-        params = urllib.parse.urlencode(
-            {"active": "true", "closed": "false", "limit": 100, "offset": offset}
-        )
+        def make_url(size, offset=offset):
+            params = urllib.parse.urlencode(
+                {"active": "true", "closed": "false", "limit": size, "offset": offset})
+            return f"{config.GAMMA_API}/events?{params}"
         try:
-            batch = _fetch(f"{config.GAMMA_API}/events?{params}")
+            batch = _fetch_events_page(make_url)
         except Exception as e:  # noqa: BLE001
             if not events:
                 raise
@@ -102,10 +129,10 @@ def _events_by_offset(max_events: int) -> List[dict]:
         if not batch:
             break
         events.extend(batch)
-        offset += 100
-        if len(batch) < 100:
+        offset += len(batch)
+        if len(batch) < _page_size():
             break
-        time.sleep(0.2)
+        time.sleep(config.PAGE_PAUSE)
     return events
 
 
@@ -330,9 +357,33 @@ def fetch_ask_book(token_id: str) -> List[AskLevel]:
     return _parse_asks(_fetch(url))
 
 
+def is_network_error(exc: BaseException) -> bool:
+    """True if the failure is our own connection (no Wi-Fi, DNS, timeout),
+    not the API answering with an error. Follows the chain of causes."""
+    import socket
+    seen = 0
+    while exc is not None and seen < 10:
+        if isinstance(exc, urllib.error.HTTPError):
+            return False
+        if isinstance(exc, (urllib.error.URLError, socket.timeout,
+                            ConnectionError, TimeoutError, OSError)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return False
+
+
+class BooksUnavailable(Exception):
+    """The order-book API is refusing requests."""
+
+
 def fetch_ask_books(token_ids: List[str], chunk: int = 50) -> Dict[str, List[AskLevel]]:
-    """Ask books for many tokens. Batches via POST /books; falls back to
-    one request per token if the batch call fails."""
+    """Ask books for many tokens, batched via POST /books.
+
+    A token missing from a successful batch simply has no book. If a batch
+    request itself fails, that chunk is fetched one token at a time; if those
+    fail too the API is refusing us, so stop instead of sending hundreds more.
+    """
     books: Dict[str, List[AskLevel]] = {}
     ids = list(dict.fromkeys(str(t) for t in token_ids))
     failed_batches, last_error = 0, None
@@ -345,16 +396,24 @@ def fetch_ask_books(token_ids: List[str], chunk: int = 50) -> Dict[str, List[Ask
                 tid = str(book.get("asset_id") or book.get("token_id") or "")
                 if tid:
                     books[tid] = _parse_asks(book)
-        except Exception as e:  # noqa: BLE001 - fall back to single fetches below
+            for t in part:
+                books.setdefault(t, [])
+            continue
+        except Exception as e:  # noqa: BLE001 - try this chunk one by one
             failed_batches += 1
             last_error = e
+        errors_in_a_row = 0
         for t in part:
-            if t not in books:
-                try:
-                    books[t] = fetch_ask_book(t)
-                except Exception:  # noqa: BLE001
-                    books[t] = []
-                time.sleep(0.05)
+            try:
+                books[t] = fetch_ask_book(t)
+                errors_in_a_row = 0
+            except Exception as e:  # noqa: BLE001
+                books[t] = []
+                errors_in_a_row += 1
+                if errors_in_a_row >= 5:
+                    raise BooksUnavailable(
+                        f"order books unavailable ({e!r})") from e
+            time.sleep(0.05)
     if failed_batches:
         log.info("  %d book batch request(s) failed (%r); fetched those one by "
                  "one, which is slower.", failed_batches, last_error)

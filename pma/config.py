@@ -56,8 +56,20 @@ MIN_EDGE_RETENTION = 0.5         # require >=50% of detected profit to remain
 # TIMING
 # ----------------------------------------------------------------------------
 SCAN_INTERVAL = 60               # seconds between scans
-# The events API stops paging at offset 2100, so that is the practical ceiling.
-MAX_EVENTS = int(os.environ.get("PMA_MAX_EVENTS", "2100"))
+MAX_EVENTS = int(os.environ.get("PMA_MAX_EVENTS", "6000"))  # events per refresh
+
+# The event list is the heavy download, so it is refreshed only this often.
+# Scans in between re-price the order books of the cached watchlist.
+DISCOVERY_INTERVAL = 60 * float(os.environ.get("PMA_DISCOVERY_MINS", "30"))
+PAGE_PAUSE = 1.0                 # seconds between event-list pages
+# Events per page, largest first. The API began refusing 100 (HTTP 406) in
+# November 2026; if a size is refused the scanner drops to the next one.
+EVENT_PAGE_SIZES = (50, 20)
+
+# When the API refuses requests, wait this long before trying again, doubling
+# after each further failure up to the maximum.
+BACKOFF_BASE = 300
+BACKOFF_MAX = 3600
 
 # Time value. Capital stays locked until the market resolves, so a gap is only
 # worth taking if its annualised return beats what the cash could earn
@@ -72,9 +84,10 @@ DEFAULT_FEE_RATE = float(os.environ.get("PMA_DEFAULT_FEE_RATE", "0.05"))
 # Every priced group is appended here each scan, gap or not.
 SCAN_LOG = "logs/scans.csv"
 
-# Skip fetching order books for groups whose quoted asks already sum above
-# $1 by more than this. Quotes can lag the book, hence the slack.
-PREFILTER_SLACK = 0.03
+# Groups whose quoted prices are further than this from parity are left off
+# the watchlist. The quotes are only refreshed with the event list, so the
+# margin is wide.
+PREFILTER_SLACK = 0.10
 
 # ----------------------------------------------------------------------------
 # ENDPOINTS & PATHS

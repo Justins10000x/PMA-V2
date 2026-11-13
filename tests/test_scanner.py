@@ -157,24 +157,165 @@ def test_parse_asks_sorts_and_drops_bad_levels():
     assert orderbook._parse_asks(book) == [(0.30, 5.0), (0.40, 10.0)]
 
 
-def test_batch_books_and_fallback(monkeypatch=None):
+def test_batch_books_missing_token_has_no_book():
     calls = {"batch": 0, "single": 0}
 
-    def fake_fetch(url, body=None):
+    def fake(url, body=None):
         if body is not None:                      # POST /books
             calls["batch"] += 1
             return [{"asset_id": "T1", "asks": [{"price": "0.2", "size": "9"}]}]
-        calls["single"] += 1                      # GET /book fallback
+        calls["single"] += 1
+        return {"asks": []}
+
+    books = _with_fetch(fake, lambda: orderbook.fetch_ask_books(["T1", "T2"]))
+    # T2 is absent from a successful batch: no book, and no extra request.
+    assert books == {"T1": [(0.2, 9.0)], "T2": []}
+    assert calls == {"batch": 1, "single": 0}
+
+
+def test_failed_batch_falls_back_to_single_fetches():
+    def fake(url, body=None):
+        if body is not None:
+            raise RuntimeError("HTTP 500")
         return {"asks": [{"price": "0.7", "size": "4"}]}
 
-    original = orderbook._fetch
-    orderbook._fetch = fake_fetch
+    books = _with_fetch(fake, lambda: orderbook.fetch_ask_books(["T1", "T2"]))
+    assert books == {"T1": [(0.7, 4.0)], "T2": [(0.7, 4.0)]}
+
+
+def test_books_give_up_when_the_api_refuses_everything():
+    calls = {"n": 0}
+
+    def fake(url, body=None):
+        calls["n"] += 1
+        raise RuntimeError("HTTP 406")
+
     try:
-        books = orderbook.fetch_ask_books(["T1", "T2"])
+        _with_fetch(fake, lambda: orderbook.fetch_ask_books([f"T{i}" for i in range(200)]))
+        raise AssertionError("expected BooksUnavailable")
+    except orderbook.BooksUnavailable:
+        pass
+    assert calls["n"] <= 6          # one batch + five singles, not hundreds
+
+
+def test_network_errors_are_told_apart_from_api_errors():
+    import socket
+    import urllib.error
+    dns = urllib.error.URLError(socket.gaierror(8, "nodename nor servname"))
+    assert orderbook.is_network_error(dns)
+    try:
+        try:
+            raise dns
+        except Exception as e:
+            raise orderbook.BooksUnavailable("order books unavailable") from e
+    except orderbook.BooksUnavailable as wrapped:
+        assert orderbook.is_network_error(wrapped)
+    refused = urllib.error.HTTPError("u", 406, "Not Acceptable", None, None)
+    assert not orderbook.is_network_error(refused)
+    assert not orderbook.is_network_error(ValueError("bad json"))
+
+
+def test_watchlist_retries_quickly_when_offline():
+    import socket
+    import urllib.error
+    original = orderbook.discover_events
+    clock = {"t": 0.0}
+
+    def offline(*a, **k):
+        raise urllib.error.URLError(socket.gaierror(8, "no dns"))
+
+    try:
+        w = _watch(offline, clock)
+        try:
+            w.refresh(_Log())
+        except Exception:
+            pass
+        assert w.seconds_until_due() == orderbook.config.SCAN_INTERVAL
+        assert w.failures == 0            # offline does not escalate back-off
     finally:
-        orderbook._fetch = original
-    assert books == {"T1": [(0.2, 9.0)], "T2": [(0.7, 4.0)]}
-    assert calls == {"batch": 1, "single": 1}
+        orderbook.discover_events = original
+
+
+# --- watchlist -------------------------------------------------------------
+class _Log:
+    def __init__(self):
+        self.lines = []
+
+    def info(self, msg, *args):
+        self.lines.append(msg % args)
+
+
+def _watch(discover, clock):
+    from pma.watchlist import Watchlist
+    orderbook.discover_events = discover
+    return Watchlist(refresh_secs=1800, clock=lambda: clock["t"])
+
+
+def test_watchlist_caches_between_refreshes():
+    from pma import watchlist as wl
+    original = orderbook.discover_events
+    calls, clock = {"n": 0}, {"t": 1000.0}
+
+    def discover(*a, **k):
+        calls["n"] += 1
+        return [event([market("A", 0.5, bestBid=0.48), market("B", 0.49, bestBid=0.47)])]
+
+    try:
+        w = _watch(discover, clock)
+        w.refresh(_Log())
+        assert calls["n"] == 1 and [s for _, s in w.pairs] == ["YES", "NO"]
+        clock["t"] += 600                  # 10 minutes later: not due
+        w.refresh(_Log())
+        assert calls["n"] == 1
+        clock["t"] += 1300                 # past 30 minutes: due
+        w.refresh(_Log())
+        assert calls["n"] == 2
+    finally:
+        orderbook.discover_events = original
+    assert wl.DiscoveryUnavailable
+
+
+def test_watchlist_keeps_old_list_and_backs_off_on_failure():
+    from pma.watchlist import DiscoveryUnavailable
+    original = orderbook.discover_events
+    clock, state = {"t": 0.0}, {"fail": False}
+
+    def discover(*a, **k):
+        if state["fail"]:
+            raise RuntimeError("HTTP 406")
+        return [event([market("A", 0.5), market("B", 0.49)])]
+
+    try:
+        w = _watch(discover, clock)
+        w.refresh(_Log())
+        kept = list(w.pairs)
+        state["fail"] = True
+        clock["t"] = 1800
+        w.refresh(_Log())                  # fails, keeps the list, waits 5 min
+        assert w.pairs == kept and w.seconds_until_due() == 300
+        clock["t"] += 300
+        w.refresh(_Log())                  # fails again: wait doubles
+        assert w.seconds_until_due() == 600
+        state["fail"] = False
+        clock["t"] += 600
+        w.refresh(_Log())                  # recovers, back to normal schedule
+        assert w.failures == 0 and w.seconds_until_due() == 1800
+
+        empty = _watch(lambda *a, **k: (_ for _ in ()).throw(RuntimeError("406")), clock)
+        try:
+            empty.refresh(_Log())
+            raise AssertionError("expected DiscoveryUnavailable")
+        except DiscoveryUnavailable:
+            pass
+    finally:
+        orderbook.discover_events = original
+
+
+def test_no_side_is_not_watched_when_a_leg_has_no_bid():
+    from pma.watchlist import Watchlist
+    ev = event([market("A", 0.5, bestBid=0.48), market("B", 0.49)])   # B: no bid
+    pairs, _ = Watchlist.build_pairs([ev])
+    assert [side for _, side in pairs] == ["YES"]
 
 
 def _with_fetch(fake, fn):
@@ -204,7 +345,8 @@ def test_discovery_follows_cursors():
 
 
 def test_discovery_falls_back_to_offset_and_survives_deep_offset_error():
-    pages = {0: [_ev(i) for i in range(100)], 100: [_ev(i) for i in range(100)]}
+    pages = {0: [_ev(i) for i in range(50)], 50: [_ev(i) for i in range(50)],
+             100: [_ev(i) for i in range(50)], 150: [_ev(i) for i in range(50)]}
 
     def fake(url, body=None):
         if "/events/keyset" in url:
@@ -221,6 +363,48 @@ def test_discovery_falls_back_to_offset_and_survives_deep_offset_error():
         raise AssertionError("expected failure")
     except RuntimeError:
         pass
+
+
+def test_discovery_steps_down_page_size_on_406():
+    import urllib.error
+    seen = []
+
+    def fake(url, body=None):
+        seen.append(url)
+        if "limit=50" in url:
+            raise urllib.error.HTTPError(url, 406, "Not Acceptable", None, None)
+        assert "limit=20" in url
+        return {"events": [_ev(1)], "next_cursor": None}
+
+    orderbook._page_size_index = 0
+    try:
+        got = _with_fetch(fake, lambda: orderbook.discover_events(5000))
+        assert [e["id"] for e in got] == [1]
+        assert orderbook._page_size() == 20          # remembered
+        # Smallest size refused too: the error surfaces instead of looping.
+        def refuse_all(url, body=None):
+            raise urllib.error.HTTPError(url, 406, "Not Acceptable", None, None)
+        try:
+            _with_fetch(refuse_all, lambda: orderbook._fetch_events_page(
+                lambda size: f"x?limit={size}"))
+            raise AssertionError("expected HTTPError")
+        except urllib.error.HTTPError:
+            pass
+    finally:
+        orderbook._page_size_index = 0
+
+
+def test_offset_paging_uses_current_page_size():
+    def fake(url, body=None):
+        if "/events/keyset" in url:
+            raise RuntimeError("HTTP 404")
+        assert "limit=50" in url
+        offset = int(url.split("offset=")[1])
+        return [_ev(i) for i in range(50)] if offset < 100 else [_ev(9)]
+
+    orderbook._page_size_index = 0
+    got = _with_fetch(fake, lambda: orderbook.discover_events(5000))
+    assert len(got) == 101
 
 
 def test_discovery_rejects_cursor_results_without_markets():
