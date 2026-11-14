@@ -248,7 +248,7 @@ class _Log:
 def _watch(discover, clock):
     from pma.watchlist import Watchlist
     orderbook.discover_events = discover
-    return Watchlist(refresh_secs=1800, clock=lambda: clock["t"])
+    return Watchlist(refresh_secs=1800, clock=lambda: clock["t"], background=False)
 
 
 def test_watchlist_caches_between_refreshes():
@@ -311,6 +311,77 @@ def test_watchlist_keeps_old_list_and_backs_off_on_failure():
         orderbook.discover_events = original
 
 
+def test_watchlist_ignores_a_list_that_shrank():
+    original = orderbook.discover_events
+    clock, state = {"t": 0.0}, {"n": 10}
+
+    def discover(*a, **k):
+        ev = event([market("A", 0.5), market("B", 0.49)])
+        return [dict(ev, slug=f"e{i}") for i in range(state["n"])]
+
+    try:
+        w = _watch(discover, clock)
+        w.refresh(_Log())
+        assert len(w.pairs) == 10
+        state["n"] = 3                     # a download cut short
+        clock["t"] = 1800
+        w.refresh(_Log())
+        assert len(w.pairs) == 10          # kept the full list
+        assert w.seconds_until_due() == orderbook.config.SCAN_INTERVAL
+        state["n"] = 9                     # normal churn is accepted
+        clock["t"] += 60
+        w.refresh(_Log())
+        assert len(w.pairs) == 9
+    finally:
+        orderbook.discover_events = original
+
+
+def test_background_refresh_keeps_old_list_until_new_one_lands():
+    import threading
+    from pma.watchlist import Watchlist
+    original = orderbook.discover_events
+    gate, clock, state = threading.Event(), {"t": 0.0}, {"n": 2}
+
+    def discover(*a, **k):
+        if state["n"] == 3:
+            gate.wait(5)                   # simulate a slow download
+        ev = event([market("A", 0.5), market("B", 0.49)])
+        return [dict(ev, slug=f"e{i}") for i in range(state["n"])]
+
+    try:
+        orderbook.discover_events = discover
+        w = Watchlist(refresh_secs=1800, clock=lambda: clock["t"], background=True)
+        w.refresh(_Log())                  # first load blocks
+        assert len(w.pairs) == 2
+        state["n"], clock["t"] = 3, 1800
+        w.refresh(_Log())                  # starts in the background, returns
+        assert w.refreshing() and len(w.pairs) == 2
+        w.refresh(_Log())                  # no second download while one runs
+        gate.set()
+        w.wait_for_refresh(5)
+        assert not w.refreshing() and len(w.pairs) == 3
+    finally:
+        orderbook.discover_events = original
+
+
+def test_discovery_does_not_keep_a_partial_list_after_a_network_error():
+    import socket
+    import urllib.error
+
+    def fake(url, body=None):
+        if "/events/keyset" in url:
+            raise RuntimeError("HTTP 404")
+        if "offset=0" in url:
+            return [_ev(i) for i in range(50)]
+        raise urllib.error.URLError(socket.gaierror(8, "no dns"))
+
+    try:
+        _with_fetch(fake, lambda: orderbook.discover_events(5000))
+        raise AssertionError("expected the network error to surface")
+    except urllib.error.URLError:
+        pass
+
+
 def test_no_side_is_not_watched_when_a_leg_has_no_bid():
     from pma.watchlist import Watchlist
     ev = event([market("A", 0.5, bestBid=0.48), market("B", 0.49)])   # B: no bid
@@ -345,6 +416,7 @@ def test_discovery_follows_cursors():
 
 
 def test_discovery_falls_back_to_offset_and_survives_deep_offset_error():
+    import urllib.error
     pages = {0: [_ev(i) for i in range(50)], 50: [_ev(i) for i in range(50)],
              100: [_ev(i) for i in range(50)], 150: [_ev(i) for i in range(50)]}
 
@@ -353,7 +425,7 @@ def test_discovery_falls_back_to_offset_and_survives_deep_offset_error():
             raise RuntimeError("HTTP 404")
         offset = int(url.split("offset=")[1])
         if offset not in pages:
-            raise RuntimeError("HTTP 422")
+            raise urllib.error.HTTPError(url, 422, "Unprocessable", None, None)
         return pages[offset]
 
     assert len(_with_fetch(fake, lambda: orderbook.discover_events(5000))) == 200
@@ -361,7 +433,7 @@ def test_discovery_falls_back_to_offset_and_survives_deep_offset_error():
     try:
         _with_fetch(fake, lambda: orderbook.discover_events(5000))
         raise AssertionError("expected failure")
-    except RuntimeError:
+    except urllib.error.HTTPError:
         pass
 
 

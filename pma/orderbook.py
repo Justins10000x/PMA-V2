@@ -120,7 +120,10 @@ def _events_by_offset(max_events: int) -> List[dict]:
         try:
             batch = _fetch_events_page(make_url)
         except Exception as e:  # noqa: BLE001
-            if not events:
+            # Only the API's deep-offset refusal (HTTP 422) means "this is as
+            # far as paging goes". Anything else would leave a partial list.
+            deep_offset = isinstance(e, urllib.error.HTTPError) and e.code == 422
+            if not events or not deep_offset:
                 raise
             log.info("  offset paging stopped at %d (%r); using %d events.",
                      offset, e, len(events))
@@ -151,6 +154,8 @@ def discover_events(max_events: int = config.MAX_EVENTS) -> List[dict]:
         try:
             events = fetch_all()
         except Exception as e:  # noqa: BLE001
+            if is_network_error(e):
+                raise            # no connection: other methods will fail too
             log.info("  discovery via %s failed (%r); trying next method.", name, e)
             continue
         if events and any(ev.get("markets") for ev in events if isinstance(ev, dict)):

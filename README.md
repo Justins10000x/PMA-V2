@@ -77,6 +77,9 @@ In a negRisk event exactly one outcome wins. Two full sets can be bought:
   are several times faster and put far less load on the API.
 - Event pages are requested 50 at a time, dropping to 20 if refused; the
   API began rejecting pages of 100 in November 2026.
+- The event list downloads in the background while scans keep pricing the
+  current watchlist. A download that comes back much smaller than the last
+  good one (for example, cut short by the Mac sleeping) is discarded.
 - When the API refuses requests the scanner keeps its last watchlist and
   waits, doubling the delay each time, instead of retrying every minute.
 
