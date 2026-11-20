@@ -84,6 +84,18 @@ DEFAULT_FEE_RATE = float(os.environ.get("PMA_DEFAULT_FEE_RATE", "0.05"))
 # Every priced group is appended here each scan, gap or not.
 SCAN_LOG = "logs/scans.csv"
 
+# Fill test: when a gap clears the hurdle, re-check the order books this many
+# seconds later and record whether the full set could still be bought.
+FILL_TEST = os.environ.get("PMA_FILL_TEST", "true").lower() == "true"
+FILL_DELAY = float(os.environ.get("PMA_FILL_DELAY", "5"))
+FILL_LOG = "logs/fills.csv"
+
+# Alerts when a gap clears the hurdle. Phone alerts need the ntfy app and a
+# topic name (treat it like a password). Mac notifications are on by default.
+NTFY_TOPIC = os.environ.get("PMA_NTFY_TOPIC", "")
+MAC_NOTIFY = os.environ.get("PMA_MAC_NOTIFY", "true").lower() == "true"
+ALERT_COOLDOWN = 30 * 60          # seconds before the same group can alert again
+
 # Groups whose quoted prices are further than this from parity are left off
 # the watchlist. The quotes are only refreshed with the event list, so the
 # margin is wide.

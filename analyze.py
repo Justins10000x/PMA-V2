@@ -6,11 +6,12 @@ crossed, and for how long.
     python analyze.py                 # all groups, best edge first
     python analyze.py --gaps-only     # only groups that ever showed a gap
     python analyze.py --file other.csv
+    python analyze.py --fills         # results of the fill test (logs/fills.csv)
 """
 
 import argparse
 import csv
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 
 
@@ -56,11 +57,43 @@ def summarise(rows):
     return out
 
 
+def summarise_fills(path):
+    try:
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f))
+    except FileNotFoundError:
+        raise SystemExit(f"No fill log at {path} yet. It is written when a gap "
+                         "clears the hurdle.")
+    if not rows:
+        raise SystemExit("Fill log is empty.")
+    order = ["held", "shrank", "gone", "unfillable"]
+    counts = Counter(r["verdict"] for r in rows)
+    print(f"{len(rows)} fill test(s), {rows[0]['ts_utc']} to {rows[-1]['ts_utc']}\n")
+    for v in order:
+        print(f"  {v:<11} {counts.get(v, 0):>4}  ({counts.get(v, 0) / len(rows):.0%})")
+    held = [r for r in rows if r["verdict"] in ("held", "shrank")]
+    kept = [_f(r["fresh_net"]) / _f(r["detected_net"]) for r in held
+            if _f(r["fresh_net"]) is not None and _f(r["detected_net"])]
+    if kept:
+        kept.sort()
+        print(f"\nWhere still profitable, median share of the detected profit "
+              f"left: {kept[len(kept) // 2]:.0%}")
+    print(f"\n{'verdict':<11} {'detected':>9} {'after':>9}  group")
+    for r in rows[-20:]:
+        after = "-" if r["fresh_net"] == "" else f"${_f(r['fresh_net']):.2f}"
+        print(f"{r['verdict']:<11} ${_f(r['detected_net']):>8.2f} {after:>9}  {r['slug'][:55]}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", default="logs/scans.csv")
     ap.add_argument("--gaps-only", action="store_true")
+    ap.add_argument("--fills", action="store_true",
+                    help="summarise the fill test log instead")
     args = ap.parse_args()
+    if args.fills:
+        summarise_fills("logs/fills.csv" if args.file == "logs/scans.csv" else args.file)
+        return
 
     try:
         with open(args.file, newline="") as f:

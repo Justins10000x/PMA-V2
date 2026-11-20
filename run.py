@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PMA v2.3 - main loop.
+PMA v2.4 - main loop.
 
 Every 30 minutes (PMA_DISCOVERY_MINS):
     download the event list (Gamma) and rebuild the watchlist: negRisk
@@ -29,7 +29,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from pma import config, control, execution, orderbook, scanlog
+from pma import alerts, config, control, execution, filltest, orderbook, scanlog
 from pma.arbitrage import annualised_pct, evaluate_group, top_of_book
 from pma.state import Session, reconcile
 from pma.watchlist import DiscoveryUnavailable, Watchlist
@@ -97,11 +97,34 @@ def find_opportunities(session, log, watch):
     return found
 
 
-def scan_once(session, client, log, watch, verbose=False):
+def monitor_gaps(opportunities, log, episodes, notifier):
+    """Fill-test and alert on gaps that have just cleared the hurdle, and log
+    when earlier ones close."""
+    above = [o for o in opportunities if o.beats_hurdle(config.HURDLE_APR)]
+    new, ended = episodes.update(above)
+    for (slug, side), minutes in ended:
+        log.info("  gap closed: %s %s after about %.0f min", side, slug[:50], minutes)
+    for opp in new:
+        fill = None
+        if config.FILL_TEST:
+            try:
+                fill = filltest.recheck(opp)
+                filltest.append(config.FILL_LOG, fill)
+                log.info("  fill test (%gs later): %s %s -> %s", fill["delay_s"],
+                         opp.side, opp.event[:44], fill["verdict"])
+            except Exception as e:  # noqa: BLE001
+                log.info("  fill test failed: %r", e)
+        if notifier.enabled:
+            notifier.send(*alerts.describe(opp, fill))
+
+
+def scan_once(session, client, log, watch, verbose=False, episodes=None, notifier=None):
     opportunities = find_opportunities(session, log, watch)
     if not watch.pairs:
         log.info("  Watchlist is empty; nothing to price until the event list loads.")
         return
+    if episodes is not None:
+        monitor_gaps(opportunities, log, episodes, notifier or alerts.Notifier(topic="", mac=False))
     if not opportunities:
         log.info("  No gap after fees on either side this scan.")
         return
@@ -133,7 +156,7 @@ def scan_once(session, client, log, watch, verbose=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PMA v2.3 scanner")
+    parser = argparse.ArgumentParser(description="PMA v2.4 scanner")
     parser.add_argument("--once", action="store_true",
                         help="run a single scan and exit")
     parser.add_argument("--verbose", action="store_true",
@@ -143,7 +166,7 @@ def main():
     config.validate()
     log = setup_logging()
     log.info("=" * 60)
-    log.info("PMA v2.3 - MODE=%s  approval=%s", config.MODE.upper(),
+    log.info("PMA v2.4 - MODE=%s  approval=%s", config.MODE.upper(),
              config.REQUIRE_APPROVAL)
     log.info("Portfolio $%.0f | max exposure $%.0f | per-position $%.0f | "
              "min gap $%.2f | hurdle %g%% a year", config.PORTFOLIO_SIZE,
@@ -158,6 +181,14 @@ def main():
     reconcile(client)
 
     watch = Watchlist()
+    episodes = alerts.Episodes()
+    notifier = alerts.Notifier(log=log)
+    log.info("Fill test: %s | alerts: %s",
+             f"on, {config.FILL_DELAY:g}s after a gap" if config.FILL_TEST else "off",
+             notifier.channels())
+    if notifier.enabled:
+        notifier.send("PMA scanner started",
+                      "Alerts are working. You will get one when a gap clears the hurdle.")
     errors = 0
     try:
         while True:
@@ -165,7 +196,8 @@ def main():
             started = time.time()
             wait = config.SCAN_INTERVAL
             try:
-                scan_once(session, client, log, watch, args.verbose)
+                scan_once(session, client, log, watch, args.verbose,
+                          episodes, notifier)
                 errors = 0
             except SystemExit:
                 raise

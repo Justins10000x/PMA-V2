@@ -1,4 +1,4 @@
-# PMA v2.3 — Polymarket negRisk scanner
+# PMA v2.4 — Polymarket negRisk scanner
 
 A research tool that scans [Polymarket](https://polymarket.com) for events
 where buying a full set of outcomes costs less than the set pays out, and
@@ -70,6 +70,19 @@ In a negRisk event exactly one outcome wins. Two full sets can be bought:
   such a gap at seconds. This tool reports NO-side gaps but does not trade or
   convert them.
 
+### Changes in v2.4
+
+- **Fill test.** When a gap clears the hurdle, the scanner re-checks the order
+  books a few seconds later (`PMA_FILL_DELAY`, default 5) and records whether
+  the full set could still be bought: held, shrank, gone or unfillable.
+  Results go to `logs/fills.csv`; `python analyze.py --fills` summarises them.
+- **Alerts.** One notification per gap that clears the hurdle, with the fill
+  test result. Mac notifications are on by default. For phone alerts, install
+  the [ntfy](https://ntfy.sh) app, subscribe to a hard-to-guess topic name,
+  and run with `PMA_NTFY_TOPIC=<that name>`. Anyone who knows the topic can
+  read the alerts, so treat it like a password.
+- The log notes when each gap closes and roughly how long it lasted.
+
 ### Changes in v2.3
 
 - The event list is downloaded every 30 minutes (`PMA_DISCOVERY_MINS`) and
@@ -106,6 +119,8 @@ pma/orderbook.py       discovery, completeness checks, order books
 pma/control.py         approval prompt and opportunity display
 pma/execution.py       FOK orders, unwind on partial fill, staleness check
 pma/scanlog.py         CSV log of every priced group
+pma/filltest.py        re-check of each gap a few seconds later
+pma/alerts.py          phone (ntfy) and Mac notifications
 pma/state.py           session accounting and persistence
 pma/config.py          settings, read from environment variables
 tests/                 offline tests for the pricing and scanner logic
@@ -130,7 +145,8 @@ The live order path has not been exercised against the real exchange; do not
 rely on it without testing with trivial size first.
 
 Settings: `PMA_PORTFOLIO`, `PMA_MIN_PROFIT`, `PMA_HURDLE_APR`, `PMA_MAX_LOSS`,
-`PMA_DEFAULT_FEE_RATE`, `PMA_MAX_EVENTS`, `PMA_DISCOVERY_MINS`, `PMA_REQUIRE_APPROVAL`.
+`PMA_DEFAULT_FEE_RATE`, `PMA_MAX_EVENTS`, `PMA_DISCOVERY_MINS`,
+`PMA_FILL_TEST`, `PMA_FILL_DELAY`, `PMA_NTFY_TOPIC`, `PMA_MAC_NOTIFY`, `PMA_REQUIRE_APPROVAL`.
 
 ---
 
